@@ -7,4 +7,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  server: {
+    port: 3000, // Forces Vite to run on http://localhost:3000
+  },
 })

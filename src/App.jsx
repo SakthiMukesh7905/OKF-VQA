@@ -326,7 +326,7 @@ const ROLES = {
     label: "Medical Student",
     sub: "Level 1 Clearance",
     level: 1,
-    token: "STUDENT_JWT_TOKEN",
+    token: mockJwt("student", 1), // <--- Valid JWT token
     icon: GraduationCap,
   },
   doctor: {
@@ -334,17 +334,27 @@ const ROLES = {
     label: "Attending Physician",
     sub: "Level 2 Clearance",
     level: 2,
-    token: "DOCTOR_JWT_TOKEN",
+    token: mockJwt("doctor", 2), // <--- Valid JWT token
     icon: Stethoscope,
   },
 };
 
-function mockJwt(seed) {
+function mockJwt(seed, level = 1) {
   const b64 = (s) => btoa(unescape(encodeURIComponent(s))).replace(/=+$/, "");
   const header = b64(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const payload = b64(JSON.stringify({ sub: seed, iat: 1732600000, iss: "aegisvqa-aws" }));
+  const payload = b64(
+    JSON.stringify({
+      sub: seed,
+      "custom:clearance_level": level, // <--- Added clearance level to JWT
+      email: seed === "doctor" ? "dr.hallow@aegis.health" : "student.k@aegis.health",
+      iat: 1732600000,
+      iss: "aegisvqa-aws",
+    })
+  );
   return `${header}.${payload}.mockSignature_${seed.toLowerCase()}`;
 }
+
+
 
 /* ---------------------------------------------------------------------------
    API LAYER — /mnt-equivalent of api.js, inlined for this artifact.
@@ -356,24 +366,43 @@ function mockJwt(seed) {
 //   const API_BASE_URL = import.meta.env.VITE_AWS_API_URL || "YOUR_AWS_API_GATEWAY_INVOKE_URL";
 // import.meta.env is Vite-only, so it's swapped for a plain constant in this
 // preview environment; the fetch below still calls the real endpoint shape.
-const API_BASE_URL = "YOUR_AWS_API_GATEWAY_INVOKE_URL";
+const API_BASE_URL = import.meta.env.VITE_AWS_API_URL || "https://07tv0tw8fd.execute-api.ap-southeast-2.amazonaws.com/prod";
 
-async function analyzeScan({ query, imageUrl, image, jwtToken, clearanceLevel }) {
-  try {
-    const res = await fetch(`${API_BASE_URL}/analyze`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${jwtToken}`,
-      },
-      body: JSON.stringify({ query, image_url: imageUrl }),
-    });
-    if (!res.ok) throw new Error(`API returned ${res.status}`);
-    return await res.json();
-  } catch (err) {
-    // Fallback — deterministic mock so the demo works without AWS wired up.
-    return mockAnalyze({ query, image, clearanceLevel });
+async function analyzeScan({ query, imageUrl, jwtToken, clearanceLevel = 1 }) {
+  const cleanBaseUrl = (import.meta.env.VITE_AWS_API_URL || API_BASE_URL).replace(/\/+$/, '');
+  
+  const res = await fetch(`${cleanBaseUrl}/analyze`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${jwtToken}`,
+    },
+    body: JSON.stringify({
+      query,
+      image_url: imageUrl,
+      clearance_level: clearanceLevel
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`AWS Error [${res.status}]: ${errText}`);
   }
+
+  // Parse initial JSON response
+  let data = await res.json();
+
+  // If Lambda returned an API Gateway proxy wrapper, parse inner body
+  if (data.body && typeof data.body === "string") {
+    data = JSON.parse(data.body);
+  }
+
+  // Ensure structure expected by React UI
+  return {
+    analysis: data.answer || data.analysis || "No response text generated.",
+    clearanceLevel: data.user_clearance || data.clearanceLevel || 1,
+    sources: data.sources || []
+  };
 }
 
 async function mockAnalyze({ query, image, clearanceLevel }) {
@@ -432,8 +461,15 @@ async function mockAnalyze({ query, image, clearanceLevel }) {
 }
 
 async function fetchAuditLogs() {
-  await new Promise((r) => setTimeout(r, 700));
-  return null; // signal: use local mock log accumulator
+  try {
+    const res = await fetch(`${API_BASE_URL}/logs`);
+    if (!res.ok) throw new Error("Failed to fetch logs");
+    const data = await res.json();
+    return data;
+  } catch (err) {
+    console.error("Error pulling audit logs from AWS:", err);
+    return null;
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -760,6 +796,11 @@ function DiagnosticOutput({ result, role, onOpenSource }) {
   if (!result) return null;
   const isL2 = result.clearanceLevel >= 2;
 
+  // Ensure sources is safely an array even if Lambda returns undefined or null
+  const sourceFiles = Array.isArray(result.sources) 
+    ? result.sources 
+    : (result.sources ? [result.sources] : []);
+
   return (
     <div className="panel-alt rounded-lg border divider p-4 fade-in space-y-3">
       <div
@@ -775,7 +816,9 @@ function DiagnosticOutput({ result, role, onOpenSource }) {
 
       <div>
         <p className="text-[11px] uppercase tracking-wide text-t3 mb-1.5 f-mono">AI Analysis</p>
-        <p className="text-sm text-t1 leading-relaxed whitespace-pre-line">{result.analysis}</p>
+        <p className="text-sm text-t1 leading-relaxed whitespace-pre-line">
+          {typeof result.analysis === 'string' ? result.analysis : JSON.stringify(result.analysis)}
+        </p>
       </div>
 
       <div>
@@ -783,24 +826,28 @@ function DiagnosticOutput({ result, role, onOpenSource }) {
           Traceable Sources (OKF Files)
         </p>
         <div className="flex flex-wrap gap-1.5">
-          {result.sources.map((file) => {
-            const meta = OKF_FILES[file];
-            const restricted = meta?.level === 2;
-            return (
-              <button
-                key={file}
-                onClick={() => onOpenSource(file)}
-                className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] f-mono transition-colors ${
-                  restricted
-                    ? "bg-amber-dim border-amber accent-amber hover:brightness-110"
-                    : "bg-teal-dim border-teal accent-teal hover:brightness-110"
-                }`}
-              >
-                {restricted ? <Lock size={11} /> : <FileText size={11} />}
-                {file}
-              </button>
-            );
-          })}
+          {sourceFiles.length === 0 ? (
+            <span className="text-xs text-t3">No sources cited for this query.</span>
+          ) : (
+            sourceFiles.map((file) => {
+              const meta = OKF_FILES[file] || { level: 1, title: file };
+              const restricted = meta?.level === 2;
+              return (
+                <button
+                  key={file}
+                  onClick={() => onOpenSource(file)}
+                  className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] f-mono transition-colors ${
+                    restricted
+                      ? "bg-amber-dim border-amber accent-amber hover:brightness-110"
+                      : "bg-teal-dim border-teal accent-teal hover:brightness-110"
+                  }`}
+                >
+                  {restricted ? <Lock size={11} /> : <FileText size={11} />}
+                  {file}
+                </button>
+              );
+            })
+          )}
         </div>
       </div>
     </div>
@@ -818,6 +865,7 @@ function VQAConsole({ selectedImage, role, jwtToken, log, onOpenSource }) {
     if (!finalQuery.trim() || !selectedImage) return;
     setLoading(true);
     setError(null);
+    console.log("Current Selected Role Level:", role.level);
     try {
       const data = await analyzeScan({
         query: finalQuery,
@@ -1070,7 +1118,18 @@ export default function App() {
 
   const refreshLogs = async () => {
     setRefreshing(true);
-    await fetchAuditLogs();
+    const liveLogs = await fetchAuditLogs();
+    if (liveLogs && Array.isArray(liveLogs)) {
+      // Map DynamoDB fields to matches your UI table columns
+      const formatted = liveLogs.map((item) => ({
+        timestamp: item.timestamp || new Date().toISOString(),
+        userId: item.user_id || "unknown",
+        clearanceLevel: item.clearance_level || 1,
+        query: item.query || "",
+        sources: item.accessed_sources || [],
+      }));
+      setLogs(formatted);
+    }
     setRefreshing(false);
   };
 
